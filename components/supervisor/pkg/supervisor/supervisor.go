@@ -24,8 +24,11 @@ import (
 	csapi "github.com/gitpod-io/gitpod/content-service/api"
 	"github.com/gitpod-io/gitpod/content-service/pkg/executor"
 	"github.com/gitpod-io/gitpod/content-service/pkg/initializer"
+	"github.com/gitpod-io/gitpod/supervisor/api"
+	"github.com/gitpod-io/gitpod/supervisor/pkg/backup"
 	"github.com/gitpod-io/gitpod/supervisor/pkg/dropwriter"
-	"github.com/gitpod-io/gitpod/supervisor/pkg/iwh"
+	"github.com/gitpod-io/gitpod/supervisor/pkg/gitpod"
+	"github.com/gitpod-io/gitpod/supervisor/pkg/ports"
 	"github.com/gitpod-io/gitpod/supervisor/pkg/terminal"
 
 	"github.com/grpc-ecosystem/grpc-gateway/runtime"
@@ -113,8 +116,13 @@ func Run(options ...RunOption) {
 		shutdown = make(chan struct{})
 		ideReady = make(chan struct{})
 		pauseIDE = make(chan bool)
-		iwh      = iwh.NewInWorkspaceHelper(cfg.RepoRoot, pauseIDE)
-		portMgmt = newPortsManager(
+		iwh      = backup.NewInWorkspaceHelper(cfg.RepoRoot, pauseIDE)
+		portMgmt = ports.NewManager(
+			createExposedPortsImpl(cfg, tokenService),
+			&ports.PollingServedPortsObserver{
+				RefreshInterval: 2 * time.Second,
+			},
+			&ports.FixedPortConfigProvider{},
 			uint32(cfg.IDEPort),
 			uint32(cfg.APIEndpointPort),
 		)
@@ -146,8 +154,11 @@ func Run(options ...RunOption) {
 	go startAndWatchIDE(ctx, cfg, &wg, ideReady, pauseIDE)
 	go startContentInit(ctx, cfg, &wg, iwh.ContentState())
 	go startAPIEndpoint(ctx, cfg, &wg, apiServices)
-	go portMgmt.Run(ctx, &wg)
 	go taskManager.Run(ctx, &wg)
+	go func() {
+		defer wg.Done()
+		portMgmt.Run()
+	}()
 
 	if cfg.PreventMetadataAccess {
 		go func() {
@@ -169,6 +180,39 @@ func Run(options ...RunOption) {
 
 	cancel()
 	wg.Wait()
+}
+
+func createExposedPortsImpl(cfg *Config, tknsrv api.TokenServiceServer) (res ports.ExposedPortsInterface) {
+	endpoint, host, err := cfg.GitpodAPIEndpoint()
+	if err != nil {
+		log.WithError(err).Fatal("cannot find Gitpod API endpoint")
+	}
+	tknres, err := tknsrv.GetToken(context.Background(), &api.GetTokenRequest{
+		Host: host,
+		Scope: []string{
+			"function:openPort",
+			"function:getOpenPorts",
+		},
+	})
+	if err != nil {
+		log.WithError(err).Error("cannot get token for Gitpod API - auto-port exposure won't work")
+		return &ports.NoopExposedPorts{}
+	}
+
+	// TODO(cw): don't just connect once and expect the connection to live forever,
+	//           instead reconnect if need be.
+	gitpodService, err := gitpod.ConnectToServer(endpoint, gitpod.ConnectToServerOpts{
+		Token: tknres.Token,
+	})
+	if err != nil {
+		log.WithError(err).Error("cannot connect to Gitpod API - auto-port exposure won't work")
+		return &ports.NoopExposedPorts{}
+	}
+
+	return &ports.GitpodExposedPorts{
+		WorkspaceID: cfg.WorkspaceID,
+		C:           gitpodService,
+	}
 }
 
 func configureGit(cfg *Config) {
