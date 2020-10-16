@@ -17,9 +17,17 @@ import (
 	"github.com/gitpod-io/gitpod/common-go/log"
 )
 
+// ConfigInterface provides an acess to the gitpod config file.
+type ConfigInterface interface {
+	// Observe provides channels triggered whenever the config is changed or errored
+	Observe(ctx context.Context) (<-chan *GitpodConfig, <-chan error)
+}
+
 // ConfigService provides an acess to the gitpod config file.
 type ConfigService struct {
-	location  string
+	location      string
+	locationReady <-chan struct{}
+
 	config    *GitpodConfig
 	listeners map[configListener]struct{}
 	stop      context.CancelFunc
@@ -32,11 +40,12 @@ type configListener struct {
 	errors  chan error
 }
 
-// NewConfigService creates a new instance of GitpodConfigService
-func NewConfigService(configLocation string) *ConfigService {
+// NewConfigService creates a new instance of ConfigService
+func NewConfigService(configLocation string, locationReady <-chan struct{}) *ConfigService {
 	return &ConfigService{
-		location:  configLocation,
-		listeners: make(map[configListener]struct{}),
+		location:      configLocation,
+		locationReady: locationReady,
+		listeners:     make(map[configListener]struct{}),
 	}
 }
 
@@ -50,6 +59,12 @@ func (service *ConfigService) Observe(ctx context.Context) (<-chan *GitpodConfig
 	go func() {
 		defer close(listener.configs)
 		defer close(listener.errors)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-service.locationReady:
+		}
 
 		err := service.start()
 		if err != nil {
@@ -113,7 +128,7 @@ func (service *ConfigService) watch(context context.Context) error {
 	watcher, startErr := fsnotify.NewWatcher()
 	defer func() {
 		if startErr != nil {
-			log.WithField("location", service.location).WithError(startErr).Fatal("Failed to start watching...")
+			log.WithField("location", service.location).WithError(startErr).Error("Failed to start watching...")
 		} else {
 			log.WithField("location", service.location).Info("Started watching")
 		}
@@ -180,7 +195,7 @@ func (service *ConfigService) tryPolling(context context.Context, err error) boo
 		return false
 	}
 	go func() {
-		timer := time.NewTicker(500 * time.Millisecond)
+		timer := time.NewTicker(2 * time.Second)
 		defer timer.Stop()
 
 		for {

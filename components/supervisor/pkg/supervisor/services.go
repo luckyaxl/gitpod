@@ -13,7 +13,7 @@ import (
 	"github.com/gitpod-io/gitpod/common-go/log"
 	csapi "github.com/gitpod-io/gitpod/content-service/api"
 	"github.com/gitpod-io/gitpod/supervisor/api"
-	"github.com/gitpod-io/gitpod/supervisor/pkg/backup"
+	"github.com/gitpod-io/gitpod/supervisor/pkg/iwh"
 	"github.com/gitpod-io/gitpod/supervisor/pkg/ports"
 	daemon "github.com/gitpod-io/gitpod/ws-daemon/api"
 	"github.com/golang/protobuf/ptypes"
@@ -40,7 +40,7 @@ type RegisterableRESTService interface {
 }
 
 type statusService struct {
-	IWH      *backup.InWorkspaceHelper
+	IWH      *iwh.InWorkspaceHelper
 	Ports    *ports.Manager
 	Tasks    *tasksManager
 	IDEReady <-chan struct{}
@@ -552,6 +552,7 @@ func (is *InfoService) WorkspaceInfo(context.Context, *api.WorkspaceInfoRequest)
 // ControlService implements the supervisor control service
 type ControlService struct {
 	UidmapCanary iwh.IDMapperService
+	portsManager *ports.Manager
 }
 
 // RegisterGRPC registers the gRPC info service
@@ -586,6 +587,12 @@ func (c *ControlService) Newuidmap(ctx context.Context, req *api.NewuidmapReques
 	}
 
 	return &api.NewuidmapResponse{}, nil
+}
+
+// ExposePort exposes a port
+func (c *ControlService) ExposePort(ctx context.Context, req *api.ExposePortRequest) (*api.ExposePortResponse, error) {
+	err := c.portsManager.Expose(req.Port, req.TargetPort)
+	return &api.ExposePortResponse{Error: err}, nil
 }
 
 // RegisterableBackupService can register the BackupService
