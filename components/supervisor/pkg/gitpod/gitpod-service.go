@@ -7,18 +7,18 @@
 package gitpod
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
+	"net/http"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
+	"github.com/recws-org/recws"
 	"github.com/sourcegraph/jsonrpc2"
-	"golang.org/x/net/websocket"
 	"golang.org/x/xerrors"
 )
 
@@ -210,121 +210,56 @@ type ConnectToServerOpts struct {
 
 // ConnectToServer establishes a new websocket connection to the server
 func ConnectToServer(endpoint string, opts ConnectToServerOpts) (*APIoverJSONRPC, error) {
-	var res APIoverJSONRPC
-	res.C = &reconnectingJSONRPCOverWS{
-		Handler: res.handler,
-		Connector: func(h jsonrpcHandlerFunc) (conn *jsonrpc2.Conn, ws *websocket.Conn, err error) {
-			if opts.Context == nil {
-				opts.Context = context.Background()
-			}
-
-			epURL, err := url.Parse(endpoint)
-			if err != nil {
-				err = xerrors.Errorf("invalid endpoint URL: %w", err)
-				return
-			}
-
-			var protocol string
-			if epURL.Scheme == "wss:" {
-				protocol = "https"
-			} else {
-				protocol = "http"
-			}
-			origin := fmt.Sprintf("%s://%s/", protocol, epURL.Hostname())
-
-			wscfg, err := websocket.NewConfig(endpoint, origin)
-			if err != nil {
-				return
-			}
-			if opts.Token != "" {
-				wscfg.Header.Set("Authorization", "Bearer "+opts.Token)
-			}
-			wsconn, err := websocket.DialConfig(wscfg)
-			if err != nil {
-				err = xerrors.Errorf("cannot dial endpoint %s: %w", endpoint, err)
-				return
-			}
-
-			conn = jsonrpc2.NewConn(opts.Context, jsonrpc2.NewBufferedStream(wsconn, simpleCodec{}), jsonrpc2.HandlerWithError(h))
-			ws = wsconn
-			return
-		},
+	if opts.Context == nil {
+		opts.Context = context.Background()
 	}
+
+	epURL, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, xerrors.Errorf("invalid endpoint URL: %w", err)
+	}
+
+	var protocol string
+	if epURL.Scheme == "wss:" {
+		protocol = "https"
+	} else {
+		protocol = "http"
+	}
+	origin := fmt.Sprintf("%s://%s/", protocol, epURL.Hostname())
+
+	reqHeader := http.Header{}
+	reqHeader.Set("Origin", origin)
+	if opts.Token != "" {
+		reqHeader.Set("Authorization", "Bearer "+opts.Token)
+	}
+	ws := &recws.RecConn{
+		KeepAliveTimeout: 10 * time.Second,
+	}
+	ws.Dial(endpoint, reqHeader)
+
+	var res APIoverJSONRPC
+	res.C = jsonrpc2.NewConn(opts.Context, &jsonRPCStream{ws: ws}, jsonrpc2.HandlerWithError(res.handler))
 	return &res, nil
 }
 
-type jsonrpcHandlerFunc func(context.Context, *jsonrpc2.Conn, *jsonrpc2.Request) (result interface{}, err error)
-
-type reconnectingJSONRPCOverWS struct {
-	mu   sync.RWMutex
-	ws   *websocket.Conn
-	conn *jsonrpc2.Conn
-
-	Connector func(h jsonrpcHandlerFunc) (conn *jsonrpc2.Conn, ws *websocket.Conn, err error)
-	Handler   jsonrpcHandlerFunc
+type jsonRPCStream struct {
+	ws *recws.RecConn
 }
-
-// Call issues a standard request (http://www.jsonrpc.org/specification#request_object).
-func (c *reconnectingJSONRPCOverWS) Call(ctx context.Context, method string, params, result interface{}, opt ...jsonrpc2.CallOption) error {
-	return c.retryWithConnection(func(conn jsonrpc2.JSONRPC2) error {
-		return conn.Call(ctx, method, params, result, opt...)
-	})
-}
-
-// Notify issues a notification request (http://www.jsonrpc.org/specification#notification).
-func (c *reconnectingJSONRPCOverWS) Notify(ctx context.Context, method string, params interface{}, opt ...jsonrpc2.CallOption) error {
-	return c.retryWithConnection(func(conn jsonrpc2.JSONRPC2) error {
-		return conn.Notify(ctx, method, params, opt...)
-	})
-}
-
-// Close closes the underlying connection, if it exists.
-func (c *reconnectingJSONRPCOverWS) Close() error {
-	return nil
-}
-
-func (c *reconnectingJSONRPCOverWS) retryWithConnection(cb func(conn jsonrpc2.JSONRPC2) error) error {
-	conn, err := c.getConnection()
-	if err != nil {
-		return err
-	}
-
-	err = cb(conn)
-
-	// TODO(cw): detect connection issues and try again
-
-	return err
-}
-
-func (c *reconnectingJSONRPCOverWS) getConnection() (jsonrpc2.JSONRPC2, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn != nil {
-		return c.conn, nil
-	}
-
-	var err error
-	c.conn, c.ws, err = c.Connector(c.Handler)
-	if err != nil {
-		// TODO(cw): attempt to reconnect with exponential backoff
-		return nil, err
-	}
-
-	return c.conn, nil
-}
-
-type simpleCodec struct{}
 
 // WriteObject writes a JSON-RPC 2.0 object to the stream.
-func (s simpleCodec) WriteObject(stream io.Writer, obj interface{}) error {
-	return json.NewEncoder(stream).Encode(obj)
+func (stream *jsonRPCStream) WriteObject(obj interface{}) error {
+	return stream.ws.WriteJSON(obj)
 }
 
 // ReadObject reads the next JSON-RPC 2.0 object from the stream
 // and stores it in the value pointed to by v.
-func (s simpleCodec) ReadObject(stream *bufio.Reader, v interface{}) error {
-	return json.NewDecoder(stream).Decode(v)
+func (stream *jsonRPCStream) ReadObject(v interface{}) error {
+	return stream.ws.ReadJSON(v)
+}
+
+func (stream *jsonRPCStream) Close() error {
+	stream.ws.Close()
+	return nil
 }
 
 // APIoverJSONRPC makes JSON RPC calls to the Gitpod server is the APIoverJSONRPC message type
