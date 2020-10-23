@@ -12,11 +12,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
 	"github.com/gitpod-io/gitpod/ws-daemon/api"
+	"github.com/gitpod-io/gitpod/ws-daemon/pkg/container"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/internal/session"
 	"github.com/opentracing/opentracing-go"
 	"golang.org/x/time/rate"
@@ -147,7 +149,7 @@ func (wbs *InWorkspaceServiceServer) MountShiftfsMark(ctx context.Context, req *
 		return nil, status.Errorf(codes.Internal, "cannot find workspace container")
 	}
 
-	rootfs, err := rt.ContainerRootfs(ctx, wscontainerID)
+	rootfs, err := rt.ContainerRootfs(ctx, wscontainerID, container.OptsContainerRootfs{Unmapped: true})
 	if err != nil {
 		log.WithError(err).WithFields(wbs.Session.OWI()).Error("MountShiftfsMark: cannot find workspace rootfs")
 		return nil, status.Errorf(codes.Internal, "cannot find workspace rootfs")
@@ -164,6 +166,39 @@ func (wbs *InWorkspaceServiceServer) MountShiftfsMark(ctx context.Context, req *
 	}
 
 	return &api.MountShiftfsMarkResponse{}, nil
+}
+
+// MountProc mounts a proc filesystem
+func (wbs *InWorkspaceServiceServer) MountProc(ctx context.Context, req *api.MountProcRequest) (resp *api.MountProcResponse, err error) {
+	pth := filepath.Clean(req.Target)
+	if !filepath.IsAbs(pth) {
+		return nil, status.Errorf(codes.InvalidArgument, "path must be absolute")
+	}
+
+	rt := wbs.Uidmapper.Runtime
+	if rt == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "not connected to container runtime")
+	}
+	wscontainerID, err := rt.WaitForContainer(ctx, wbs.Session.InstanceID)
+	if err != nil {
+		log.WithError(err).WithFields(wbs.Session.OWI()).Error("MountProc: cannot find workspace container")
+		return nil, status.Errorf(codes.Internal, "cannot find workspace container")
+	}
+
+	rootfs, err := rt.ContainerRootfs(ctx, wscontainerID, container.OptsContainerRootfs{Unmapped: false})
+	if err != nil {
+		log.WithError(err).WithFields(wbs.Session.OWI()).Error("MountProc: cannot find workspace rootfs")
+		return nil, status.Errorf(codes.Internal, "cannot find workspace rootfs")
+	}
+
+	mountpoint := filepath.Join(rootfs, pth)
+	err = syscall.Mount("proc", mountpoint, "proc", 0, "")
+	if err != nil {
+		log.WithError(err).WithFields(wbs.Session.OWI()).Error("MountProc: cannot mount proc")
+		return nil, status.Errorf(codes.Internal, "cannot mount proc")
+	}
+
+	return &api.MountProcResponse{}, nil
 }
 
 // WriteIDMapping writes /proc/.../uid_map and /proc/.../gid_map for a workapce container
