@@ -9,7 +9,7 @@ import type { PortsStatus } from '@gitpod/supervisor-api-grpc/lib/status_pb';
 import { Emitter } from '@theia/core/lib/common/event';
 import { Deferred } from '@theia/core/lib/common/promise-util';
 import { inject, injectable, postConstruct } from 'inversify';
-import { GitpodPortServer, ExposeGitpodPortParams } from '../../common/gitpod-port-server';
+import { GitpodPortServer, ExposeGitpodPortParams, DidChangeGitpodPortsEvent } from '../../common/gitpod-port-server';
 import { getWorkspaceID } from '../utils';
 import { GitpodServiceProvider } from '../gitpod-service-provider';
 import { MaybePromise } from '@theia/core/lib/common/types';
@@ -45,26 +45,32 @@ export class GitpodPortsService {
     protected init(): void {
         // register client before connection is opened
         this.server.setClient({
-            onDidChange: ({ ports }) => this.updatePorts(ports)
+            onDidChange: event => this.updatePorts(event)
         });
-        this.server.getPorts().then(ports => this.updatePorts(ports));
+        this.server.getPorts().then(added => this.updatePorts({ added }));
     }
 
     get ports(): IterableIterator<PortsStatus.AsObject> {
         return this._ports.values();
     }
 
-    private updatePorts(ports: PortsStatus.AsObject[]): void {
-        const toDelete = new Set<number>();
-        for (const port of ports) {
-            const current = this._ports.get(port.localPort);
-            this._ports.set(port.localPort, port);
-            if (isExposedServedPort(port) && !isExposedServedPort(current)) {
-                this.onDidExposeServedPortEmitter.fire(port);
+    private updatePorts({ added, updated, removed }: DidChangeGitpodPortsEvent): void {
+        for (const ports of [added, updated]) {
+            if (ports === undefined) {
+                continue;
+            }
+            for (const port of ports) {
+                const current = this._ports.get(port.localPort);
+                this._ports.set(port.localPort, port);
+                if (isExposedServedPort(port) && !isExposedServedPort(current)) {
+                    this.onDidExposeServedPortEmitter.fire(port);
+                }
             }
         }
-        for (const port of toDelete) {
-            this._ports.delete(port);
+        if (removed) {
+            for (const port of removed) {
+                this._ports.delete(port);
+            }
         }
         this.onDidChangeEmitter.fire();
     }

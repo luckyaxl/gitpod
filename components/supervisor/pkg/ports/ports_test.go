@@ -6,9 +6,7 @@ package ports
 
 import (
 	"context"
-	"io"
 	"io/ioutil"
-	"sort"
 	"sync"
 	"testing"
 
@@ -19,9 +17,8 @@ import (
 )
 
 func TestPortsUpdateState(t *testing.T) {
-	type StateExpectation [][]managedPort
 	type ExposureExpectation []ExposedPort
-	type UpdateExpectation [][]*api.PortsStatus
+	type UpdateExpectation []*Diff
 	type Change struct {
 		Config     *gitpod.GitpodConfig
 		Served     []ServedPort
@@ -35,7 +32,6 @@ func TestPortsUpdateState(t *testing.T) {
 		InternalPorts    []uint32
 		WorkspacePorts   []*gitpod.PortConfig
 		Changes          []Change
-		ExpectedState    StateExpectation
 		ExpectedExposure ExposureExpectation
 		ExpectedUpdates  UpdateExpectation
 	}{
@@ -45,19 +41,12 @@ func TestPortsUpdateState(t *testing.T) {
 				{Served: []ServedPort{{8080, true}}},
 				{Served: []ServedPort{}},
 			},
-			ExpectedState: StateExpectation{
-				[]managedPort{
-					{Served: false, GlobalPort: 60000, LocalhostPort: 8080, IsOurProxy: true},
-					{Served: true, GlobalPort: 60000, LocalhostPort: 8080, IsOurProxy: false, Proxy: ioutil.NopCloser(nil)},
-				},
-				[]managedPort{},
-			},
 			ExpectedExposure: []ExposedPort{
 				{LocalPort: 8080, GlobalPort: 60000},
 			},
 			ExpectedUpdates: UpdateExpectation{
-				{{LocalPort: 8080, GlobalPort: 60000, Served: true}},
-				{},
+				{Added: []*api.PortsStatus{{LocalPort: 8080, GlobalPort: 60000, Served: true}}},
+				{Removed: []uint32{8080}},
 			},
 		},
 		{
@@ -66,16 +55,12 @@ func TestPortsUpdateState(t *testing.T) {
 				{Served: []ServedPort{{8080, false}}},
 				{Served: []ServedPort{}},
 			},
-			ExpectedState: StateExpectation{
-				[]managedPort{{Served: true, GlobalPort: 8080, LocalhostPort: 8080}},
-				[]managedPort{},
-			},
 			ExpectedExposure: []ExposedPort{
 				{LocalPort: 8080, GlobalPort: 8080},
 			},
 			ExpectedUpdates: UpdateExpectation{
-				{{LocalPort: 8080, GlobalPort: 8080, Served: true}},
-				{},
+				{Added: []*api.PortsStatus{{LocalPort: 8080, GlobalPort: 8080, Served: true}}},
+				{Removed: []uint32{8080}},
 			},
 		},
 		{
@@ -85,15 +70,10 @@ func TestPortsUpdateState(t *testing.T) {
 				{Exposed: []ExposedPort{{LocalPort: 8080, GlobalPort: 8080, Public: true, URL: "foobar"}}},
 				{Served: []ServedPort{{Port: 8080}}},
 			},
-			ExpectedState: StateExpectation{
-				[]managedPort{{Exposed: true, GlobalPort: 8080, LocalhostPort: 8080, Public: false, URL: "foobar", OnExposed: api.PortsStatus_ExposedPortInfo_notify_private}},
-				[]managedPort{{Exposed: true, GlobalPort: 8080, LocalhostPort: 8080, Public: true, URL: "foobar", OnExposed: api.PortsStatus_ExposedPortInfo_notify_private}},
-				[]managedPort{{Exposed: true, GlobalPort: 8080, LocalhostPort: 8080, Public: true, URL: "foobar", Served: true, OnExposed: api.PortsStatus_ExposedPortInfo_notify_private}},
-			},
 			ExpectedUpdates: UpdateExpectation{
-				{{LocalPort: 8080, GlobalPort: 8080, Exposed: &api.PortsStatus_ExposedPortInfo{Public: false, Url: "foobar", OnExposed: api.PortsStatus_ExposedPortInfo_notify_private}}},
-				{{LocalPort: 8080, GlobalPort: 8080, Exposed: &api.PortsStatus_ExposedPortInfo{Public: true, Url: "foobar", OnExposed: api.PortsStatus_ExposedPortInfo_notify_private}}},
-				{{LocalPort: 8080, GlobalPort: 8080, Served: true, Exposed: &api.PortsStatus_ExposedPortInfo{Public: true, Url: "foobar", OnExposed: api.PortsStatus_ExposedPortInfo_notify_private}}},
+				{Added: []*api.PortsStatus{{LocalPort: 8080, GlobalPort: 8080, Exposed: &api.PortsStatus_ExposedPortInfo{Public: false, Url: "foobar", OnExposed: api.PortsStatus_ExposedPortInfo_notify_private}}}},
+				{Updated: []*api.PortsStatus{{LocalPort: 8080, GlobalPort: 8080, Exposed: &api.PortsStatus_ExposedPortInfo{Public: true, Url: "foobar", OnExposed: api.PortsStatus_ExposedPortInfo_notify_private}}}},
+				{Updated: []*api.PortsStatus{{LocalPort: 8080, GlobalPort: 8080, Served: true, Exposed: &api.PortsStatus_ExposedPortInfo{Public: true, Url: "foobar", OnExposed: api.PortsStatus_ExposedPortInfo_notify_private}}}},
 			},
 		},
 		{
@@ -104,13 +84,11 @@ func TestPortsUpdateState(t *testing.T) {
 				{Served: []ServedPort{{8080, false}}},
 			},
 
-			// serving internal ports does not cause any state change
-			ExpectedState:    StateExpectation{},
 			ExpectedExposure: ExposureExpectation(nil),
 			ExpectedUpdates:  UpdateExpectation(nil),
 		},
 		{
-			Desc: "workspace port config",
+			Desc: "serving configured workspace port",
 			WorkspacePorts: []*gitpod.PortConfig{
 				{Port: 8080, OnOpen: "open-browser"},
 				{Port: 9229, OnOpen: "ignore", Visibility: "private"},
@@ -129,30 +107,20 @@ func TestPortsUpdateState(t *testing.T) {
 					},
 				},
 			},
-			ExpectedState: StateExpectation{
-				[]managedPort{
-					{LocalhostPort: 8080, OnExposed: api.PortsStatus_ExposedPortInfo_open_browser},
-					{LocalhostPort: 9229, OnExposed: api.PortsStatus_ExposedPortInfo_ignore},
-				},
-				[]managedPort{
-					{LocalhostPort: 8080, GlobalPort: 8080, Exposed: true, Public: true, URL: "8080-foobar", OnExposed: api.PortsStatus_ExposedPortInfo_open_browser},
-					{LocalhostPort: 9229, GlobalPort: 9229, Exposed: true, URL: "9229-foobar", OnExposed: api.PortsStatus_ExposedPortInfo_ignore},
-				},
-				[]managedPort{
-					{LocalhostPort: 8080, GlobalPort: 8080, Served: true, Exposed: true, Public: true, URL: "8080-foobar", OnExposed: api.PortsStatus_ExposedPortInfo_open_browser},
-					{LocalhostPort: 9229, GlobalPort: 9229, Served: true, Exposed: true, URL: "9229-foobar", OnExposed: api.PortsStatus_ExposedPortInfo_ignore},
-				},
-			},
 			ExpectedExposure: []ExposedPort{
 				{LocalPort: 8080, Public: true},
 				{LocalPort: 9229},
 			},
 			ExpectedUpdates: UpdateExpectation{
-				{{LocalPort: 8080}, {LocalPort: 9229}},
-				{
+				{Added: []*api.PortsStatus{{LocalPort: 8080}, {LocalPort: 9229}}},
+				{Updated: []*api.PortsStatus{
 					{LocalPort: 8080, GlobalPort: 8080, Exposed: &api.PortsStatus_ExposedPortInfo{Public: true, Url: "8080-foobar", OnExposed: api.PortsStatus_ExposedPortInfo_open_browser}},
 					{LocalPort: 9229, GlobalPort: 9229, Exposed: &api.PortsStatus_ExposedPortInfo{Public: false, Url: "9229-foobar", OnExposed: api.PortsStatus_ExposedPortInfo_ignore}},
-				},
+				}},
+				{Updated: []*api.PortsStatus{
+					{LocalPort: 8080, GlobalPort: 8080, Served: true, Exposed: &api.PortsStatus_ExposedPortInfo{Public: true, Url: "8080-foobar", OnExposed: api.PortsStatus_ExposedPortInfo_open_browser}},
+					{LocalPort: 9229, GlobalPort: 60000, Served: true, Exposed: &api.PortsStatus_ExposedPortInfo{Public: false, Url: "9229-foobar", OnExposed: api.PortsStatus_ExposedPortInfo_ignore}},
+				}},
 			},
 		},
 	}
@@ -180,8 +148,7 @@ func TestPortsUpdateState(t *testing.T) {
 				config      = NewConfigService(workspaceID, configService, gitpodAPI)
 
 				pm    = NewManager(exposed, served, config, test.InternalPorts...)
-				act   = make(StateExpectation, 0, len(test.Changes))
-				updts [][]*api.PortsStatus
+				updts []*Diff
 			)
 			gitpodAPI.EXPECT().GetWorkspace(context, workspaceID).Times(1).Return(&gitpod.WorkspaceInfo{
 				Workspace: &gitpod.Workspace{
@@ -190,23 +157,12 @@ func TestPortsUpdateState(t *testing.T) {
 					},
 				},
 			}, nil)
-			pm.proxyStarter = func(dst *managedPort, openPorts map[uint32]struct{}) (err error) {
-				dst.GlobalPort = 60000
-				dst.Proxy = ioutil.NopCloser(nil)
-				return nil
-			}
-			pm.testingStatusChanged = func() {
-				tact := make([]managedPort, 0, len(pm.state))
-				for _, mp := range pm.state {
-					tact = append(tact, *mp)
-				}
-				sort.Slice(tact, func(i, j int) bool {
-					if tact[i].LocalhostPort == tact[j].LocalhostPort {
-						return tact[i].IsOurProxy
-					}
-					return tact[i].LocalhostPort < tact[j].LocalhostPort
-				})
-				act = append(act, tact)
+			pm.proxyStarter = func(localPort uint32, openPorts map[uint32]struct{}) (*localhostProxy, error) {
+				return &localhostProxy{
+					Closer:     ioutil.NopCloser(nil),
+					localPort:  localPort,
+					globalPort: 60000,
+				}, nil
 			}
 
 			var wg sync.WaitGroup
@@ -257,14 +213,6 @@ func TestPortsUpdateState(t *testing.T) {
 			}()
 
 			wg.Wait()
-			cmpopts := []cmp.Option{
-				cmp.Comparer(func(a, b io.Closer) bool {
-					return (a == nil && b == nil) || (a != nil && b != nil)
-				}),
-			}
-			if diff := cmp.Diff(test.ExpectedState, act, cmpopts...); diff != "" {
-				t.Errorf("unexpected state (-want +got):\n%s", diff)
-			}
 			if diff := cmp.Diff(test.ExpectedExposure, ExposureExpectation(exposed.Exposures)); diff != "" {
 				t.Errorf("unexpected exposures (-want +got):\n%s", diff)
 			}

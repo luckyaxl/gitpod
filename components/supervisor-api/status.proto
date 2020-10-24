@@ -117,7 +117,9 @@ message PortsStatusRequest {
     bool observe = 1;
 }
 message PortsStatusResponse {
-    repeated PortsStatus ports = 1;
+    repeated PortsStatus added = 1;
+    repeated PortsStatus updated = 2;
+    repeated uint32 removed = 3;
 }
 message PortsStatus {
     message ExposedPortInfo {

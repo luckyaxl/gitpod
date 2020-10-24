@@ -27,7 +27,6 @@ type ConfigService struct {
 	instancePortConfigs  map[uint32]*gitpod.PortConfig
 	instanceRangeConfigs []*RangeConfig
 	mutex                sync.RWMutex
-	ready                chan struct{}
 }
 
 // RangeConfig is a port range config
@@ -44,7 +43,6 @@ func NewConfigService(workspaceID string, configService gitpod.ConfigInterface, 
 		configService:   configService,
 		gitpodAPI:       gitpodAPI,
 		portRangeRegexp: regexp.MustCompile("^(\\d+)[-:](\\d+)$"),
-		ready:           make(chan struct{}),
 	}
 }
 
@@ -59,11 +57,6 @@ func (service *ConfigService) ForEach(callback func(port uint32, config *gitpod.
 
 // Get returns the config for the give port
 func (service *ConfigService) Get(port uint32) (*gitpod.PortConfig, bool) {
-	<-service.ready
-
-	service.mutex.RLock()
-	defer service.mutex.RUnlock()
-
 	config, exists := service.instancePortConfigs[port]
 	if exists {
 		return config, true
@@ -77,7 +70,6 @@ func (service *ConfigService) Get(port uint32) (*gitpod.PortConfig, bool) {
 
 // GetRange returns the range config for the give port
 func (service *ConfigService) GetRange(port uint32) (*gitpod.PortConfig, bool) {
-	<-service.ready
 	for _, rangeConfig := range service.instanceRangeConfigs {
 		if rangeConfig.Start <= port && port <= rangeConfig.End {
 			return &gitpod.PortConfig{
@@ -121,7 +113,6 @@ func (service *ConfigService) Observe(ctx context.Context) (<-chan struct{}, <-c
 			errorsChan <- errors.New("failed to fetch the worksapce info - no connection ot the gitpod server")
 		}
 
-		init := true
 		configs, errs := service.configService.Observe(ctx)
 		for {
 			select {
@@ -129,10 +120,6 @@ func (service *ConfigService) Observe(ctx context.Context) (<-chan struct{}, <-c
 				return
 			case config := <-configs:
 				service.update(config)
-				if init {
-					close(service.ready)
-					init = false
-				}
 				updatesChan <- struct{}{}
 			case err := <-errs:
 				errorsChan <- err
